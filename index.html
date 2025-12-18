@@ -1,0 +1,218 @@
+import { _decorator, Component, Node, Mask, Graphics, EventTouch, UITransform, v3, AudioSource, math, ParticleSystem2D, Vec2 } from 'cc';
+const { ccclass, property } = _decorator;
+
+@ccclass('PowerWasher')
+export class PowerWasher extends Component {
+
+    // --- 介面設定 (拖曳節點到這裡) ---
+    @property({ type: Mask, tooltip: '掛載 Mask 的節點 (Type 設為 GRAPHICS_STENCIL)' })
+    maskNode: Mask = null!;
+
+    @property({ type: Node, tooltip: '噴嘴或準心圖片 (會跟隨手指移動)' })
+    nozzleNode: Node = null!;
+
+    @property({ type: AudioSource, tooltip: '持續的噴水聲 (記得在屬性面板把 Loop 打勾)' })
+    waterSound: AudioSource = null!;
+
+    @property({ type: AudioSource, tooltip: '勝利時的音效' })
+    winSound: AudioSource = null!;
+
+    @property({ type: ParticleSystem2D, tooltip: '水花噴濺特效 (可選)' })
+    waterParticles: ParticleSystem2D = null!;
+
+    // --- 內部變數 ---
+    private _graphics: Graphics = null!;
+    private _lastPos: math.Vec2 = new math.Vec2();
+    private _isWashing: boolean = false;
+    private _isWon: boolean = false;
+
+    // --- 進度檢測變數 ---
+    private _gridPoints: math.Vec2[] = [];
+    private _cleanedPoints: boolean[] = [];
+    private _totalPoints: number = 0;
+    private _cleanedCount: number = 0;
+    
+    // --- 參數設定 ---
+    private readonly BRUSH_SIZE = 50; // 水柱粗細
+    private readonly WIN_THRESHOLD = 0.96; // 勝利門檻 (96%)
+
+    start() {
+        // 1. 初始化 Graphics 筆刷
+        this._graphics = this.maskNode.getComponent(Graphics)!;
+        if (!this._graphics) {
+            console.error("Mask 節點下找不到 Graphics 組件！請確認 Mask Type 是 GRAPHICS_STENCIL");
+            return;
+        }
+
+        // 設定水柱筆刷樣式
+        this._graphics.lineWidth = this.BRUSH_SIZE;
+        this._graphics.lineJoin = Graphics.LineJoin.ROUND;
+        this._graphics.lineCap = Graphics.LineCap.ROUND;
+        // 畫筆顏色設為透明 (用來挖洞)，但在 Mask 模式下，其實畫什麼顏色不重要，有畫就行
+        this._graphics.strokeColor = math.Color.WHITE; 
+
+        // 2. 初始化進度檢測網格 (12x12 格，精度適中)
+        this.initGrid(12, 12);
+
+        // 3. 註冊觸摸事件
+        this.node.on(Node.EventType.TOUCH_START, this.onTouchStart, this);
+        this.node.on(Node.EventType.TOUCH_MOVE, this.onTouchMove, this);
+        this.node.on(Node.EventType.TOUCH_END, this.onTouchEnd, this);
+        this.node.on(Node.EventType.TOUCH_CANCEL, this.onTouchEnd, this);
+
+        // 初始化狀態
+        if(this.waterParticles) this.waterParticles.stopSystem();
+        if(this.nozzleNode) this.nozzleNode.active = false;
+    }
+
+    // --- 觸摸事件邏輯 ---
+
+    onTouchStart(event: EventTouch) {
+        if (this._isWon) return;
+
+        const pos = event.getUILocation();
+        const localPos = this.convertToNodeSpace(pos);
+
+        // 移動筆刷起點
+        this._graphics.moveTo(localPos.x, localPos.y);
+        this._lastPos.set(localPos.x, localPos.y);
+
+        this._isWashing = true;
+
+        // 視覺：顯示噴嘴
+        if (this.nozzleNode) {
+            this.nozzleNode.active = true;
+            this.nozzleNode.setPosition(v3(localPos.x, localPos.y, 0));
+        }
+
+        // 特效：播放水花粒子
+        if (this.waterParticles) {
+            this.waterParticles.resetSystem();
+        }
+
+        // 聲音：播放噴水聲 (高壓水槍是按下就有聲音，不用管速度)
+        if (this.waterSound && !this.waterSound.playing) {
+            this.waterSound.play();
+        }
+
+        // 按下時也要檢查一次 (避免玩家只點一下不動)
+        this.checkProgress(localPos);
+    }
+
+    onTouchMove(event: EventTouch) {
+        if (!this._isWashing || this._isWon) return;
+
+        const pos = event.getUILocation();
+        const localPos = this.convertToNodeSpace(pos);
+
+        // 1. 繪製路徑 (把髒東西洗掉)
+        this._graphics.lineTo(localPos.x, localPos.y);
+        this._graphics.stroke();
+
+        // 2. 更新噴嘴和粒子位置
+        if (this.nozzleNode) {
+            this.nozzleNode.setPosition(v3(localPos.x, localPos.y, 0));
+        }
+        if (this.waterParticles) {
+            this.waterParticles.node.setPosition(v3(localPos.x, localPos.y, 0));
+        }
+
+        // 3. 檢查進度
+        this.checkProgress(localPos);
+
+        // 更新位置
+        this._lastPos.set(localPos.x, localPos.y);
+    }
+
+    onTouchEnd(event: EventTouch) {
+        this._isWashing = false;
+
+        // 停止聲音和特效
+        if (this.waterSound) this.waterSound.stop();
+        if (this.waterParticles) this.waterParticles.stopSystem();
+        // 噴嘴可以選擇隱藏或保留
+        // if (this.nozzleNode) this.nozzleNode.active = false; 
+    }
+
+    // --- 核心功能函式 ---
+
+    // 建立隱形網格
+    initGrid(rows: number, cols: number) {
+        // 假設清潔區域大小，這裡抓 600x600，建議根據你的背景圖實際大小調整
+        // 你也可以用 this.maskNode.getComponent(UITransform).contentSize 來動態獲取
+        const width = 600; 
+        const height = 1000; // 假設是手機直式螢幕
+        const startX = -width / 2;
+        const startY = -height / 2;
+        const stepX = width / cols;
+        const stepY = height / rows;
+
+        for (let i = 0; i < rows; i++) {
+            for (let j = 0; j < cols; j++) {
+                // 取格子的中心點
+                const x = startX + j * stepX + stepX / 2;
+                const y = startY + i * stepY + stepY / 2;
+                this._gridPoints.push(new math.Vec2(x, y));
+                this._cleanedPoints.push(false);
+            }
+        }
+        this._totalPoints = this._gridPoints.length;
+        console.log(`網格初始化完成，共 ${this._totalPoints} 個檢查點`);
+    }
+
+    // 檢查是否有碰到網格點
+    checkProgress(currentPos: math.Vec2) {
+        // 為了效能，我們不需要每次遍歷所有點
+        // 這裡做一個簡單優化：只檢查 "尚未乾淨" 的點
+        
+        let hit = false;
+        const checkRadius = this.BRUSH_SIZE / 1.5; // 檢查半徑略小於筆刷，手感比較真實
+
+        for (let i = 0; i < this._totalPoints; i++) {
+            if (this._cleanedPoints[i]) continue;
+
+            // 計算距離
+            const dist = math.Vec2.distance(currentPos, this._gridPoints[i]);
+
+            if (dist < checkRadius) {
+                this._cleanedPoints[i] = true;
+                this._cleanedCount++;
+                hit = true;
+            }
+        }
+
+        if (hit) {
+            const progress = this._cleanedCount / this._totalPoints;
+            // console.log(`清潔度: ${(progress * 100).toFixed(1)}%`);
+
+            if (progress >= this.WIN_THRESHOLD) {
+                this.onLevelComplete();
+            }
+        }
+    }
+
+    onLevelComplete() {
+        this._isWon = true;
+        console.log("Stage Cleared!");
+
+        // 1. 停止噴水聲
+        if (this.waterSound) this.waterSound.stop();
+        if (this.waterParticles) this.waterParticles.stopSystem();
+
+        // 2. 播放勝利音效
+        if (this.winSound) this.winSound.play();
+
+        // 3. 視覺獎勵：直接關閉 Mask，露出完美的乾淨圖 (解決角落沒擦乾淨的強迫症)
+        this.maskNode.enabled = false; 
+
+        // 4. (可選) 播放滿天彩帶特效或彈出 UI
+    }
+
+    // 座標轉換 (世界 -> 節點局部)
+    private convertToNodeSpace(worldPos: math.Vec2): math.Vec2 {
+        const transform = this.maskNode.getComponent(UITransform);
+        // 注意：Cocos 3.x 使用 Vec3，且要轉換到 maskNode 的空間
+        const pos3d = transform!.convertToNodeSpaceAR(v3(worldPos.x, worldPos.y, 0));
+        return new math.Vec2(pos3d.x, pos3d.y);
+    }
+}
